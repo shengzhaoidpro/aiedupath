@@ -1,0 +1,5 @@
+{
+  "name": "KnowledgePath AI",
+  "description": "An interactive learning path generator that visualizes knowledge networks and curates multimedia study resources using Gemini AI.",
+  "requestFramePermissions": []
+}
