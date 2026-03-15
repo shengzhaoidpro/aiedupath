@@ -1,4 +1,7 @@
 import { GraphData, Node, NodeDetailData } from "../types";
+import graphGenerationRaw from "../prompts/graph-generation.md?raw";
+import nodeDescriptionsRaw from "../prompts/node-descriptions.md?raw";
+import nodeDetailsRaw from "../prompts/node-details.md?raw";
 
 const API_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = "deepseek-chat";
@@ -9,35 +12,41 @@ const getApiKey = () => {
   return key;
 };
 
-const PROMPT = (topic: string) => `你是专业课程设计专家。为主题「${topic}」生成结构化知识图谱骨架。
+// ── Prompt helpers ────────────────────────────────────────────────────────────
 
-只输出 JSON，不要有任何解释文字或代码块标记。
-
-格式：
-{
-  "nodes": [
-    {"id": "root", "label": "主题名称", "level": 0, "prerequisites": [], "estimatedHours": 0, "difficulty": "beginner"},
-    {"id": "core_1", "label": "核心模块（10字内）", "level": 1, "prerequisites": ["root"], "estimatedHours": 10, "difficulty": "beginner"},
-    {"id": "topic_1_1", "label": "具体知识点（10字内）", "level": 2, "prerequisites": ["core_1"], "estimatedHours": 3, "difficulty": "beginner"}
-  ],
-  "edges": [
-    {"source": "root", "target": "core_1"},
-    {"source": "core_1", "target": "topic_1_1"}
-  ]
+/** Extract system / user content from an MD prompt file.
+ *  The first HTML comment `<!-- system: ... -->` becomes the system message;
+ *  everything else (after stripping the comment) is the user message. */
+function parsePromptFile(raw: string): { system: string; user: string } {
+  const match = raw.match(/<!--\s*system:\s*([\s\S]*?)\s*-->/);
+  return {
+    system: match?.[1]?.trim() ?? "",
+    user: raw.replace(/<!--[\s\S]*?-->/g, "").trim(),
+  };
 }
 
-规则：
-1. 根节点1个
-2. 主干节点（level=1）：3-6个，名称具体
-3. 叶子节点（level=2）：每主干下2-4个
-4. 总节点数 12-20个
-5. 使用中文`;
+/** Replace `{{KEY}}` placeholders with the supplied values. */
+function fillPrompt(template: string, vars: Record<string, string>): string {
+  return Object.entries(vars).reduce(
+    (t, [k, v]) => t.replaceAll(`{{${k}}}`, v),
+    template
+  );
+}
 
-const groupOf = (level: number): Node['group'] =>
-  level === 0 ? 'Foundation' : level === 1 ? 'Core' : level === 2 ? 'Advanced' : 'Related';
+// Parse MD files once at module load
+const graphGen   = parsePromptFile(graphGenerationRaw);
+const nodeDesc   = parsePromptFile(nodeDescriptionsRaw);
+const nodeDetail = parsePromptFile(nodeDetailsRaw);
+
+// ── Type helpers ──────────────────────────────────────────────────────────────
+
+const groupOf = (level: number): Node["group"] =>
+  level === 0 ? "Foundation" : level === 1 ? "Core" : level === 2 ? "Advanced" : "Related";
+
+// ── API functions ─────────────────────────────────────────────────────────────
 
 /**
- * 流式生成学习路径。
+ * 流式生成学习路径（Phase 1）。
  * onProgress(nodeCount, labels) 在每发现新节点时调用，可用于实时更新 UI。
  */
 export const generateLearningPath = async (
@@ -55,8 +64,8 @@ export const generateLearningPath = async (
       model: MODEL,
       stream: true,
       messages: [
-        { role: "system", content: "你是专业课程设计专家，只输出符合要求的 JSON。" },
-        { role: "user", content: PROMPT(topic) },
+        { role: "system", content: graphGen.system },
+        { role: "user",   content: fillPrompt(graphGen.user, { TOPIC: topic }) },
       ],
     }),
     signal,
@@ -71,7 +80,7 @@ export const generateLearningPath = async (
 
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
+  let buffer = "";
   let lastNodeCount = 0;
 
   try {
@@ -79,14 +88,14 @@ export const generateLearningPath = async (
       const { done, value } = await reader.read();
       if (done) break;
 
-      for (const line of decoder.decode(value, { stream: true }).split('\n')) {
+      for (const line of decoder.decode(value, { stream: true }).split("\n")) {
         const trimmed = line.trim();
-        if (!trimmed.startsWith('data: ')) continue;
+        if (!trimmed.startsWith("data: ")) continue;
         const data = trimmed.slice(6);
-        if (data === '[DONE]') continue;
+        if (data === "[DONE]") continue;
         try {
-          buffer += JSON.parse(data).choices?.[0]?.delta?.content || '';
-        } catch { /* ignore parse errors on SSE chunks */ }
+          buffer += JSON.parse(data).choices?.[0]?.delta?.content || "";
+        } catch { /* ignore SSE parse errors */ }
       }
 
       if (onProgress) {
@@ -110,32 +119,25 @@ export const generateLearningPath = async (
     id: node.id,
     orderId: index + 1,
     label: node.label,
-    description: '',
+    description: "",
     group: groupOf(node.level),
     level: node.level,
     prerequisites: node.prerequisites || [],
     estimatedHours: node.estimatedHours || 0,
-    difficulty: node.difficulty || 'beginner',
+    difficulty: node.difficulty || "beginner",
   }));
 
   return { nodes, edges: rawData.edges };
 };
 
 /**
- * 批量生成节点一句话简介（Phase 2，后台运行）
+ * 批量生成节点一句话简介（Phase 2，后台运行）。
  */
 export const enrichNodeDescriptions = async (
   nodes: { id: string; label: string }[],
   topic: string
 ): Promise<Record<string, string>> => {
-  const nodeList = nodes.map(n => `${n.id}: ${n.label}`).join('\n');
-  const prompt = `为以下「${topic}」知识图谱的各节点写一句话简介（15-30字，说明该知识点的核心内容或作用）。
-
-节点列表：
-${nodeList}
-
-只输出 JSON，key 为节点 id，value 为简介：
-{"node_id": "简介文字", ...}`;
+  const nodeList = nodes.map(n => `${n.id}: ${n.label}`).join("\n");
 
   const res = await fetch(API_URL, {
     method: "POST",
@@ -146,8 +148,8 @@ ${nodeList}
     body: JSON.stringify({
       model: MODEL,
       messages: [
-        { role: "system", content: "你是专业课程设计专家，只输出符合要求的 JSON。" },
-        { role: "user", content: prompt },
+        { role: "system", content: nodeDesc.system },
+        { role: "user",   content: fillPrompt(nodeDesc.user, { TOPIC: topic, NODE_LIST: nodeList }) },
       ],
       response_format: { type: "json_object" },
     }),
@@ -155,7 +157,7 @@ ${nodeList}
 
   if (!res.ok) return {};
   const data = await res.json() as any;
-  const text = data.choices?.[0]?.message?.content as string || '';
+  const text = data.choices?.[0]?.message?.content as string || "";
   const jsonMatch = text.match(/\{[\s\S]*\}/);
   if (!jsonMatch) return {};
   try {
@@ -165,17 +167,10 @@ ${nodeList}
   }
 };
 
+/**
+ * 获取单个节点的详细学习指南。
+ */
 export const fetchNodeDetails = async (nodeLabel: string, mainTopic: string): Promise<NodeDetailData> => {
-  const prompt = `我正在学习「${mainTopic}」，请为子主题「${nodeLabel}」提供详细的学习指南。
-
-请用 Markdown 格式组织回答：
-1. **概念讲解**：清晰深入地解释该概念（约150字）
-2. **核心要点**：用要点列举最重要的内容
-3. **实践示例**：提供一个真实的使用场景或代码示例（如适用）
-4. **学习资源**：推荐3-5个高质量的免费学习资源（官方文档、视频教程或权威文章）
-
-重要：全部内容必须使用简体中文。`;
-
   const res = await fetch(API_URL, {
     method: "POST",
     headers: {
@@ -185,8 +180,8 @@ export const fetchNodeDetails = async (nodeLabel: string, mainTopic: string): Pr
     body: JSON.stringify({
       model: MODEL,
       messages: [
-        { role: "system", content: "你是一位专业的技术教育专家，用简体中文提供清晰、实用的学习指导。" },
-        { role: "user", content: prompt },
+        { role: "system", content: nodeDetail.system },
+        { role: "user",   content: fillPrompt(nodeDetail.user, { NODE_LABEL: nodeLabel, MAIN_TOPIC: mainTopic }) },
       ],
     }),
   });
