@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useMemo } from 'react';
 import * as d3 from 'd3';
 import { GraphData, Node } from '../types';
 
@@ -8,311 +8,330 @@ interface GraphViewProps {
   selectedNodeId?: string | null;
 }
 
-// Color palette matching the "Roadmap" style (Yellows/Beiges)
-const groupColors: Record<string, string> = {
-  'Foundation': '#fde047', // Yellow-300 (Bright)
-  'Core': '#fef08a',       // Yellow-200
-  'Advanced': '#ffedd5',   // Orange-100 (Beige)
-  'Practical': '#fef3c7',  // Amber-100 (Light Beige)
-  'Related': '#f1f5f9',    // Slate-100 (Greyish)
+// Per-level zone + node styling
+const levelStyles: Record<number, {
+  zoneBg: string; zoneStroke: string;
+  nodeBg: string; nodeBorder: string;
+  dot: string; label: string;
+}> = {
+  0: {
+    zoneBg: '#fffdf5', zoneStroke: '#fde68a',
+    nodeBg: '#fffbeb', nodeBorder: '#fde68a',
+    dot: '#f59e0b', label: '起步阶段',
+  },
+  1: {
+    zoneBg: '#f5f9ff', zoneStroke: '#bfdbfe',
+    nodeBg: '#eff6ff', nodeBorder: '#bfdbfe',
+    dot: '#3b82f6', label: '核心模块',
+  },
+  2: {
+    zoneBg: '#fdf9ff', zoneStroke: '#e9d5ff',
+    nodeBg: '#faf5ff', nodeBorder: '#e9d5ff',
+    dot: '#a855f7', label: '知识要点',
+  },
 };
 
-// Chinese labels for the legend
-const groupLabels: Record<string, string> = {
-  'Foundation': '基础概念',
-  'Core': '核心理论',
-  'Advanced': '进阶优化',
-  'Practical': '实战应用',
-  'Related': '相关拓展',
+const fallbackStyle = {
+  zoneBg: '#f8fafc', zoneStroke: '#e2e8f0',
+  nodeBg: '#f8fafc', nodeBorder: '#e2e8f0',
+  dot: '#94a3b8', label: '拓展内容',
 };
+
+const NODE_W = 158;
+const NODE_H = 108;
+const X_GAP = 16;        // horizontal gap between nodes within a row
+const Y_GAP = 14;        // vertical gap between rows within a zone
+const ZONE_PAD_X = 36;   // horizontal padding inside zone rect
+const ZONE_PAD_TOP = 48; // space for zone label + top padding
+const ZONE_PAD_BOT = 28; // bottom padding inside zone rect
+const ZONE_GAP = 44;     // vertical gap between zones
+const ZONE_R = 16;       // corner radius
+const MAX_PER_ROW = 5;   // max nodes per row
+
+interface ZoneRect {
+  level: number;
+  x: number; y: number; w: number; h: number;
+}
+
+function computeLayout(nodes: Node[]): {
+  positions: Map<string, { x: number; y: number }>;
+  zones: ZoneRect[];
+} {
+  const positions = new Map<string, { x: number; y: number }>();
+  const zones: ZoneRect[] = [];
+  if (!nodes.length) return { positions, zones };
+
+  const byLevel = new Map<number, Node[]>();
+  for (const n of nodes) {
+    const lv = n.level ?? 0;
+    if (!byLevel.has(lv)) byLevel.set(lv, []);
+    byLevel.get(lv)!.push(n);
+  }
+
+  const levels = [...byLevel.keys()].sort((a, b) => a - b);
+
+  // Zone width based on max nodes per row (capped at MAX_PER_ROW)
+  let maxLevelNodes = 0;
+  for (const [, ns] of byLevel) maxLevelNodes = Math.max(maxLevelNodes, ns.length);
+  const maxRowNodes = Math.min(maxLevelNodes, MAX_PER_ROW);
+  const maxContentW = maxRowNodes * NODE_W + Math.max(0, maxRowNodes - 1) * X_GAP;
+  const zoneW = maxContentW + ZONE_PAD_X * 2;
+  const zoneX = -zoneW / 2;
+
+  let curY = 0;
+
+  for (const level of levels) {
+    const levelNodes = byLevel.get(level)!;
+
+    // Split into rows of MAX_PER_ROW
+    const rows: Node[][] = [];
+    for (let i = 0; i < levelNodes.length; i += MAX_PER_ROW) {
+      rows.push(levelNodes.slice(i, i + MAX_PER_ROW));
+    }
+
+    rows.forEach((row, rowIdx) => {
+      // Center each row horizontally within the zone
+      const rowContentW = row.length * NODE_W + Math.max(0, row.length - 1) * X_GAP;
+      const startX = zoneX + ZONE_PAD_X + (maxContentW - rowContentW) / 2;
+      const nodeY = curY + ZONE_PAD_TOP + rowIdx * (NODE_H + Y_GAP) + NODE_H / 2;
+
+      row.forEach((node, i) => {
+        positions.set(node.id, {
+          x: startX + i * (NODE_W + X_GAP) + NODE_W / 2,
+          y: nodeY,
+        });
+      });
+    });
+
+    const numRows = rows.length;
+    const zoneH = ZONE_PAD_TOP + numRows * NODE_H + Math.max(0, numRows - 1) * Y_GAP + ZONE_PAD_BOT;
+    zones.push({ level, x: zoneX, y: curY, w: zoneW, h: zoneH });
+    curY += zoneH + ZONE_GAP;
+  }
+
+  return { positions, zones };
+}
 
 const GraphView: React.FC<GraphViewProps> = ({ data, onNodeClick, selectedNodeId }) => {
   const svgRef = useRef<SVGSVGElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
-  const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+  const gRef = useRef<SVGGElement>(null);
+  const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
+  const [dims, setDims] = React.useState({ w: 0, h: 0 });
 
-  // Refs to maintain D3 state across renders without triggering effects
-  const simulationRef = useRef<d3.Simulation<any, undefined> | null>(null);
-  const zoomBehaviorRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
-  const svgSelectionRef = useRef<d3.Selection<SVGSVGElement, unknown, null, undefined> | null>(null);
-  const nodesDataRef = useRef<any[]>([]); // Store current node positions
-  const mainGroupRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null);
-  
-  // Stable callback ref to avoid effect dependency on onNodeClick
-  const onNodeClickRef = useRef(onNodeClick);
-  useEffect(() => {
-    onNodeClickRef.current = onNodeClick;
-  }, [onNodeClick]);
+  const nodeIds = data.nodes.map(n => n.id).join(',');
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const { positions, zones } = useMemo(() => computeLayout(data.nodes), [nodeIds]);
 
-  // Fixed dimensions for the card nodes
-  const nodeWidth = 200;
-  const nodeHeight = 80;
-
-  // Handle Resize using ResizeObserver to catch sidebar toggles
+  // Resize observer
   useEffect(() => {
     if (!wrapperRef.current) return;
-
-    const resizeObserver = new ResizeObserver(entries => {
-      for (let entry of entries) {
-        setDimensions({
-          width: entry.contentRect.width,
-          height: entry.contentRect.height
-        });
-      }
-    });
-
-    resizeObserver.observe(wrapperRef.current);
-    
-    return () => {
-      resizeObserver.disconnect();
-    };
+    const ro = new ResizeObserver(([e]) =>
+      setDims({ w: e.contentRect.width, h: e.contentRect.height })
+    );
+    ro.observe(wrapperRef.current);
+    return () => ro.disconnect();
   }, []);
 
-  // 1. Initialize and Render Graph
-  // This effect runs ONLY when data changes or window resizes.
+  // Setup D3 zoom (once)
   useEffect(() => {
-    if (!dimensions.width || !dimensions.height || !data.nodes.length) return;
-
+    if (!svgRef.current || !gRef.current) return;
     const svg = d3.select(svgRef.current);
-    svgSelectionRef.current = svg;
-    svg.selectAll("*").remove(); // Clear previous
+    const g = d3.select(gRef.current);
 
-    const { width, height } = dimensions;
-
-    // Create mutable data copies
-    const nodes = data.nodes.map(d => ({ ...d }));
-    const links = data.edges.map(d => ({ ...d }));
-
-    // SORT nodes by orderId to ensure proper grid placement logic
-    nodes.sort((a, b) => a.orderId - b.orderId);
-
-    nodesDataRef.current = nodes; // Store reference for zoom logic
-
-    // --- GRID LAYOUT CONFIGURATION ---
-    // Layout parameters
-    const COLUMNS = 4; // Number of nodes per row
-    const X_SPACING = 280; // Horizontal distance between node centers
-    const Y_SPACING = 150; // Vertical distance between rows
-    
-    // Calculate total grid size to center it
-    const totalRows = Math.ceil(nodes.length / COLUMNS);
-    const gridWidth = Math.min(nodes.length, COLUMNS) * X_SPACING;
-    const gridHeight = totalRows * Y_SPACING;
-    
-    // Starting coordinates to center the grid
-    // We adjust X by half spacing because grid points are centers
-    const startX = (width - gridWidth) / 2 + (X_SPACING / 2);
-    const startY = (height - gridHeight) / 2 + (Y_SPACING / 2);
-
-    // Simulation setup
-    const simulation = d3.forceSimulation(nodes as any)
-      .force("link", d3.forceLink(links).id((d: any) => d.id).distance(200).strength(0.2)) // Weaken links so grid dominates
-      .force("charge", d3.forceManyBody().strength(-300)) // Light repulsion
-      .force("collide", d3.forceCollide().radius(nodeWidth / 1.5).strength(1)) // Prevent overlap
-      // Force X: Drive nodes to their column position
-      .force("x", d3.forceX((d: any, i: number) => {
-         const col = i % COLUMNS;
-         return startX + (col * X_SPACING);
-      }).strength(1.5)) // High strength to enforce structure
-      // Force Y: Drive nodes to their row position
-      .force("y", d3.forceY((d: any, i: number) => {
-         const row = Math.floor(i / COLUMNS);
-         return startY + (row * Y_SPACING);
-      }).strength(1.5));
-    
-    simulationRef.current = simulation;
-
-    // SVG Group for zooming
-    const g = svg.append("g");
-    mainGroupRef.current = g;
-
-    // Zoom behavior
     const zoom = d3.zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.1, 4])
-      .on("zoom", (event) => {
-        g.attr("transform", event.transform);
-      });
-    
+      .scaleExtent([0.1, 3])
+      .on('zoom', ev => g.attr('transform', ev.transform.toString()));
+
+    zoomRef.current = zoom;
     svg.call(zoom);
-    zoomBehaviorRef.current = zoom;
+    return () => { svg.on('.zoom', null); };
+  }, []);
 
-    // Render Links
-    const link = g.append("g")
-      .attr("stroke", "#3b82f6") // Blue-500
-      .attr("stroke-opacity", 0.6)
-      .selectAll("path") // Using path for potentially curved lines, though straight here
-      .data(links)
-      .join("line")
-      .attr("stroke-width", 2)
-      .attr("stroke-dasharray", "5,5");
-
-    // Arrowhead marker (Blue)
-    svg.append("defs").append("marker")
-      .attr("id", "arrowhead")
-      .attr("viewBox", "0 -5 10 10")
-      .attr("refX", nodeWidth / 2 + 10) 
-      .attr("refY", 0)
-      .attr("markerWidth", 6)
-      .attr("markerHeight", 6)
-      .attr("orient", "auto")
-      .append("path")
-      .attr("d", "M0,-5L10,0L0,5")
-      .attr("fill", "#3b82f6");
-
-    link.attr("marker-end", "url(#arrowhead)");
-
-    // Group for Nodes
-    const nodeGroup = g.append("g")
-      .selectAll(".node-group")
-      .data(nodes)
-      .join("g")
-      .attr("class", "node-group")
-      .attr("cursor", "pointer")
-      .call(d3.drag<SVGGElement, any>()
-        .on("start", (event, d) => {
-          if (!event.active) simulation.alphaTarget(0.3).restart();
-          d.fx = d.x;
-          d.fy = d.y;
-        })
-        .on("drag", (event, d) => {
-          d.fx = event.x;
-          d.fy = event.y;
-        })
-        .on("end", (event, d) => {
-          if (!event.active) simulation.alphaTarget(0);
-          d.fx = null;
-          d.fy = null;
-        })
-      )
-      .on("click", (event, d) => {
-        event.stopPropagation();
-        if (onNodeClickRef.current) {
-          onNodeClickRef.current(d as unknown as Node);
-        }
-      });
-
-    // 1. ForeignObject for HTML Card Content
-    nodeGroup.append("foreignObject")
-      .attr("width", nodeWidth)
-      .attr("height", nodeHeight)
-      .attr("x", -nodeWidth / 2)
-      .attr("y", -nodeHeight / 2)
-      .append("xhtml:div")
-      .style("width", "100%")
-      .style("height", "100%")
-      .style("background-color", d => groupColors[d.group] || '#fef3c7')
-      .style("border", "2px solid #0f172a") // Slate-900
-      .style("border-radius", "8px")
-      .style("display", "flex")
-      .style("flex-direction", "column")
-      .style("justify-content", "center")
-      .style("align-items", "center")
-      .style("padding", "8px 12px")
-      .style("box-sizing", "border-box")
-      .style("box-shadow", "2px 2px 0px rgba(15, 23, 42, 0.1)")
-      .style("transition", "transform 0.1s ease")
-      .html(d => `
-        <div style="width: 100%; text-align: center; margin-bottom: 4px;">
-          <div style="font-size: 14px; font-weight: 700; color: #0f172a; line-height: 1.2; font-family: 'Inter', sans-serif;">
-            ${d.label}
-          </div>
-        </div>
-        <div style="width: 100%; text-align: center; overflow: hidden;">
-          <div style="font-size: 10px; color: #475569; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; text-overflow: ellipsis;">
-            ${d.description}
-          </div>
-        </div>
-      `);
-
-    // 2. Order Badge (Top Left Corner)
-    const badgeRadius = 10;
-    const badgeGroup = nodeGroup.append("g")
-      .attr("transform", `translate(${-nodeWidth / 2}, ${-nodeHeight / 2})`);
-
-    badgeGroup.append("circle")
-      .attr("r", badgeRadius)
-      .attr("cx", 0)
-      .attr("cy", 0)
-      .attr("fill", "#3b82f6") // Blue-500
-      .attr("stroke", "#fff")
-      .attr("stroke-width", 1.5);
-
-    badgeGroup.append("text")
-      .text(d => d.orderId)
-      .attr("x", 0)
-      .attr("y", 0)
-      .attr("text-anchor", "middle")
-      .attr("dy", ".35em")
-      .style("font-size", "10px")
-      .style("font-weight", "bold")
-      .style("fill", "#fff");
-
-    // Simulation tick
-    simulation.on("tick", () => {
-      link
-        .attr("x1", (d: any) => d.source.x)
-        .attr("y1", (d: any) => d.source.y)
-        .attr("x2", (d: any) => d.target.x)
-        .attr("y2", (d: any) => d.target.y);
-
-      nodeGroup
-        .attr("transform", (d: any) => `translate(${d.x},${d.y})`);
-    });
-
-    // Cleanup simulation on unmount or data change
-    return () => {
-      simulation.stop();
-    };
-
-  }, [data, dimensions.width, dimensions.height]); 
-
-  // 2. Handle Focus / Zoom to Selected Node
+  // Fit all zones into view when node structure changes
   useEffect(() => {
-    if (!selectedNodeId || !nodesDataRef.current.length || !svgSelectionRef.current || !zoomBehaviorRef.current) return;
+    if (!svgRef.current || !zoomRef.current || !dims.w || !zones.length) return;
 
-    const node = nodesDataRef.current.find(n => n.id === selectedNodeId);
-    
-    if (node) {
-      const { width, height } = dimensions;
-      const scale = 1.2; 
-      
-      const panelWidth = 600;
-      const availableWidth = width > 1000 ? width - panelWidth : width;
-      const centerOffsetX = width > 1000 ? availableWidth / 2 : width / 2;
-      
-      const tx = centerOffsetX - scale * node.x;
-      const ty = height / 2 - scale * node.y;
+    const margin = 48;
+    const minX = zones[0].x - margin;
+    const maxX = zones[0].x + zones[0].w + margin;
+    const minY = zones[0].y - margin;
+    const lastZone = zones[zones.length - 1];
+    const maxY = lastZone.y + lastZone.h + margin;
+    const gW = maxX - minX;
+    const gH = maxY - minY;
 
-      const transform = d3.zoomIdentity.translate(tx, ty).scale(scale);
+    const scale = Math.min(1, (dims.w - 80) / gW, (dims.h - 80) / gH);
+    const tx = (dims.w - gW * scale) / 2 - minX * scale;
+    const ty = (dims.h - gH * scale) / 2 - minY * scale;
 
-      svgSelectionRef.current
-        .transition()
-        .duration(750) 
-        .call(zoomBehaviorRef.current.transform, transform);
-    }
-  }, [selectedNodeId, dimensions.width, dimensions.height]);
+    d3.select(svgRef.current)
+      .transition().duration(500)
+      .call(zoomRef.current.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeIds, dims.w, dims.h]);
+
+  // Zoom to selected node
+  useEffect(() => {
+    if (!selectedNodeId || !svgRef.current || !zoomRef.current || !dims.w) return;
+    const p = positions.get(selectedNodeId);
+    if (!p) return;
+
+    const scale = 1.15;
+    const panelW = dims.w > 1000 ? 600 : 0;
+    const cx = (dims.w - panelW) / 2;
+    const cy = dims.h / 2;
+
+    d3.select(svgRef.current)
+      .transition().duration(500)
+      .call(
+        zoomRef.current.transform,
+        d3.zoomIdentity.translate(cx - scale * p.x, cy - scale * p.y).scale(scale)
+      );
+  }, [selectedNodeId, positions, dims]);
+
+  // Vertical Bezier: bottom of source → top of target
+  const edgePath = (srcId: string, tgtId: string): string | null => {
+    const s = positions.get(srcId);
+    const t = positions.get(tgtId);
+    if (!s || !t) return null;
+    const x1 = s.x, y1 = s.y + NODE_H / 2;
+    const x2 = t.x, y2 = t.y - NODE_H / 2;
+    const my = (y1 + y2) / 2;
+    return `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`;
+  };
 
   return (
-    <div ref={wrapperRef} className="w-full h-full relative overflow-hidden bg-slate-50"> 
+    <div ref={wrapperRef} className="w-full h-full relative overflow-hidden bg-[#f5f5f0]">
       {data.nodes.length === 0 && (
         <div className="absolute inset-0 flex items-center justify-center text-slate-400">
           <p>请输入想要学习的主题以生成知识路径。</p>
         </div>
       )}
-      <svg ref={svgRef} className="w-full h-full"></svg>
-      
-      {/* Legend */}
-      {data.nodes.length > 0 && (
-        <div className="absolute bottom-4 left-4 bg-white/90 backdrop-blur p-3 rounded-lg border border-slate-200 shadow-lg text-xs z-10">
-          <h4 className="font-bold mb-2 text-slate-800">图例 (Legend)</h4>
-          {Object.entries(groupColors).map(([group, color]) => (
-            <div key={group} className="flex items-center mb-1">
-              <span className="w-3 h-3 rounded-full mr-2 border border-slate-300" style={{ backgroundColor: color }}></span>
-              <span className="text-slate-600 font-medium">{groupLabels[group] || group}</span>
-            </div>
-          ))}
-        </div>
-      )}
+
+      <svg ref={svgRef} className="w-full h-full">
+        <defs>
+          <marker id="arr" viewBox="0 -5 10 10" refX="8" refY="0"
+            markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,-5L10,0L0,5" fill="#94a3b8" />
+          </marker>
+        </defs>
+
+        <g ref={gRef}>
+          {/* ── Zone backgrounds ── */}
+          {zones.map(zone => {
+            const s = levelStyles[zone.level] || fallbackStyle;
+            const num = String(zone.level + 1).padStart(2, '0');
+            return (
+              <g key={`zone-${zone.level}`}>
+                <rect
+                  x={zone.x} y={zone.y}
+                  width={zone.w} height={zone.h}
+                  rx={ZONE_R} ry={ZONE_R}
+                  fill={s.zoneBg}
+                  stroke={s.zoneStroke}
+                  strokeWidth={1.5}
+                />
+                {/* Zone label: numbered dot + text */}
+                <circle cx={zone.x + 22} cy={zone.y + 22} r={8} fill={s.dot} />
+                <text x={zone.x + 22} y={zone.y + 22}
+                  textAnchor="middle" dominantBaseline="central"
+                  fontSize={9} fontWeight="bold" fill="#fff"
+                  style={{ pointerEvents: 'none' }}>
+                  {num}
+                </text>
+                <text x={zone.x + 36} y={zone.y + 26}
+                  fontSize={12} fontWeight={600}
+                  fill={s.dot} letterSpacing={0.3}
+                  style={{ pointerEvents: 'none' }}>
+                  {s.label}
+                </text>
+              </g>
+            );
+          })}
+
+          {/* ── Edges ── */}
+          {data.edges.map((edge, i) => {
+            const srcId = typeof edge.source === 'string' ? edge.source : (edge.source as Node).id;
+            const tgtId = typeof edge.target === 'string' ? edge.target : (edge.target as Node).id;
+            const d = edgePath(srcId, tgtId);
+            if (!d) return null;
+            return (
+              <path key={i} d={d} fill="none"
+                stroke="#cbd5e1" strokeWidth={1.5}
+                strokeDasharray="5,4" markerEnd="url(#arr)" />
+            );
+          })}
+
+          {/* ── Nodes ── */}
+          {data.nodes.map(node => {
+            const p = positions.get(node.id);
+            if (!p) return null;
+            const selected = selectedNodeId === node.id;
+            const s = levelStyles[node.level ?? 0] || fallbackStyle;
+            return (
+              <g key={node.id}
+                transform={`translate(${p.x - NODE_W / 2},${p.y - NODE_H / 2})`}
+                onClick={() => onNodeClick(node)}
+                style={{ cursor: 'pointer' }}>
+
+                <foreignObject width={NODE_W} height={NODE_H}>
+                  <div style={{
+                    width: '100%', height: '100%',
+                    backgroundColor: s.nodeBg,
+                    border: `1.5px solid ${selected ? s.dot : s.nodeBorder}`,
+                    borderRadius: 12,
+                    display: 'flex', flexDirection: 'column',
+                    justifyContent: 'flex-start',
+                    padding: '10px 12px', boxSizing: 'border-box',
+                    boxShadow: selected
+                      ? `0 0 0 3px ${s.dot}33`
+                      : '0 1px 4px rgba(0,0,0,0.06)',
+                    transition: 'border-color 0.15s, box-shadow 0.15s',
+                  }}>
+                    {/* Title row: dot + label */}
+                    <div style={{
+                      display: 'flex', alignItems: 'flex-start', gap: 6,
+                      marginBottom: node.description ? 5 : 0,
+                    }}>
+                      <span style={{
+                        width: 7, height: 7, borderRadius: '50%',
+                        backgroundColor: s.dot,
+                        flexShrink: 0, marginTop: 4,
+                      }} />
+                      <div style={{
+                        fontSize: 13, fontWeight: 700, color: '#1e293b',
+                        lineHeight: 1.35, flex: 1,
+                      }}>
+                        {node.label}
+                      </div>
+                    </div>
+                    {/* Description */}
+                    {node.description && (
+                      <div style={{
+                        fontSize: 11, color: '#64748b',
+                        lineHeight: 1.55, paddingLeft: 13,
+                        overflow: 'hidden', display: '-webkit-box',
+                        WebkitLineClamp: 3, WebkitBoxOrient: 'vertical',
+                      }}>
+                        {node.description}
+                      </div>
+                    )}
+                  </div>
+                </foreignObject>
+
+                {/* Order badge */}
+                <circle cx={0} cy={0} r={10} fill={s.dot} stroke="#fff" strokeWidth={1.5} />
+                <text x={0} y={0} textAnchor="middle" dy=".35em"
+                  fontSize={10} fontWeight="bold" fill="#fff"
+                  style={{ pointerEvents: 'none' }}>
+                  {node.orderId}
+                </text>
+              </g>
+            );
+          })}
+        </g>
+      </svg>
     </div>
   );
 };

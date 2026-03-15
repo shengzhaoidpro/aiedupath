@@ -1,4 +1,4 @@
-import { GraphData, NodeDetailData } from "../types";
+import { GraphData, Node, NodeDetailData } from "../types";
 
 const API_URL = "https://api.deepseek.com/chat/completions";
 const MODEL = "deepseek-chat";
@@ -9,29 +9,42 @@ const getApiKey = () => {
   return key;
 };
 
-const retryWithBackoff = async <T>(fn: () => Promise<T>, retries = 3, delay = 4000): Promise<T> => {
-  try {
-    return await fn();
-  } catch (error: any) {
-    const status = error?.status || error?.code;
-    const message = error?.message || '';
-    const isRateLimit = status === 429 ||
-      message.includes('429') ||
-      message.includes('RESOURCE_EXHAUSTED') ||
-      message.includes('quota') ||
-      message.includes('rate limit');
+const PROMPT = (topic: string) => `你是专业课程设计专家。为主题「${topic}」生成结构化知识图谱骨架。
 
-    if (retries > 0 && isRateLimit) {
-      console.warn(`Rate limit hit. Retrying in ${delay}ms... (${retries} retries left)`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return retryWithBackoff(fn, retries - 1, delay * 2);
-    }
-    if (isRateLimit) throw new Error(`QUOTA_EXCEEDED: ${message}`);
-    throw error;
-  }
-};
+只输出 JSON，不要有任何解释文字或代码块标记。
 
-const callDeepSeek = async (messages: { role: string; content: string }[], jsonMode = false) => {
+格式：
+{
+  "nodes": [
+    {"id": "root", "label": "主题名称", "level": 0, "prerequisites": [], "estimatedHours": 0, "difficulty": "beginner"},
+    {"id": "core_1", "label": "核心模块（10字内）", "level": 1, "prerequisites": ["root"], "estimatedHours": 10, "difficulty": "beginner"},
+    {"id": "topic_1_1", "label": "具体知识点（10字内）", "level": 2, "prerequisites": ["core_1"], "estimatedHours": 3, "difficulty": "beginner"}
+  ],
+  "edges": [
+    {"source": "root", "target": "core_1"},
+    {"source": "core_1", "target": "topic_1_1"}
+  ]
+}
+
+规则：
+1. 根节点1个
+2. 主干节点（level=1）：3-6个，名称具体
+3. 叶子节点（level=2）：每主干下2-4个
+4. 总节点数 12-20个
+5. 使用中文`;
+
+const groupOf = (level: number): Node['group'] =>
+  level === 0 ? 'Foundation' : level === 1 ? 'Core' : level === 2 ? 'Advanced' : 'Related';
+
+/**
+ * 流式生成学习路径。
+ * onProgress(nodeCount, labels) 在每发现新节点时调用，可用于实时更新 UI。
+ */
+export const generateLearningPath = async (
+  topic: string,
+  onProgress?: (nodeCount: number, labels: string[]) => void,
+  signal?: AbortSignal
+): Promise<GraphData> => {
   const res = await fetch(API_URL, {
     method: "POST",
     headers: {
@@ -40,115 +53,116 @@ const callDeepSeek = async (messages: { role: string; content: string }[], jsonM
     },
     body: JSON.stringify({
       model: MODEL,
-      messages,
-      ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+      stream: true,
+      messages: [
+        { role: "system", content: "你是专业课程设计专家，只输出符合要求的 JSON。" },
+        { role: "user", content: PROMPT(topic) },
+      ],
     }),
+    signal,
   });
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     const msg = (err as any)?.error?.message || res.statusText;
-    const error: any = new Error(msg);
-    error.status = res.status;
-    throw error;
+    if (res.status === 429) throw Object.assign(new Error(`QUOTA_EXCEEDED: ${msg}`), { status: 429 });
+    throw Object.assign(new Error(msg), { status: res.status });
   }
 
-  const data = await res.json() as any;
-  return data.choices?.[0]?.message?.content as string;
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let lastNodeCount = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      for (const line of decoder.decode(value, { stream: true }).split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data: ')) continue;
+        const data = trimmed.slice(6);
+        if (data === '[DONE]') continue;
+        try {
+          buffer += JSON.parse(data).choices?.[0]?.delta?.content || '';
+        } catch { /* ignore parse errors on SSE chunks */ }
+      }
+
+      if (onProgress) {
+        const matches = [...buffer.matchAll(/"label"\s*:\s*"([^"]+)"/g)];
+        if (matches.length !== lastNodeCount) {
+          lastNodeCount = matches.length;
+          onProgress(lastNodeCount, matches.map(m => m[1]));
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const jsonMatch = buffer.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error("No valid JSON found in response");
+
+  const rawData = JSON.parse(jsonMatch[0]);
+
+  const nodes: Node[] = rawData.nodes.map((node: any, index: number) => ({
+    id: node.id,
+    orderId: index + 1,
+    label: node.label,
+    description: '',
+    group: groupOf(node.level),
+    level: node.level,
+    prerequisites: node.prerequisites || [],
+    estimatedHours: node.estimatedHours || 0,
+    difficulty: node.difficulty || 'beginner',
+  }));
+
+  return { nodes, edges: rawData.edges };
 };
 
-export const generateLearningPath = async (topic: string): Promise<GraphData> => {
-  const prompt = `你是一位专业的课程设计专家和知识图谱设计师。请为主题「${topic}」生成一个高质量的结构化知识点学习路径。
+/**
+ * 批量生成节点一句话简介（Phase 2，后台运行）
+ */
+export const enrichNodeDescriptions = async (
+  nodes: { id: string; label: string }[],
+  topic: string
+): Promise<Record<string, string>> => {
+  const nodeList = nodes.map(n => `${n.id}: ${n.label}`).join('\n');
+  const prompt = `为以下「${topic}」知识图谱的各节点写一句话简介（15-30字，说明该知识点的核心内容或作用）。
 
-只输出 JSON，不要有任何解释文字、markdown 代码块标记或其他内容。
+节点列表：
+${nodeList}
 
-输出格式：
-{
-  "nodes": [
-    {
-      "id": "root",
-      "label": "主题名称",
-      "description": "200字左右的总体介绍",
-      "level": 0,
-      "prerequisites": [],
-      "estimatedHours": 0,
-      "difficulty": "beginner"
+只输出 JSON，key 为节点 id，value 为简介：
+{"node_id": "简介文字", ...}`;
+
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${getApiKey()}`,
     },
-    {
-      "id": "core_1",
-      "label": "核心模块名（10字以内）",
-      "description": "200字左右描述",
-      "level": 1,
-      "prerequisites": ["root"],
-      "estimatedHours": 10,
-      "difficulty": "beginner"
-    },
-    {
-      "id": "topic_1_1",
-      "label": "具体知识点（10字以内）",
-      "description": "200字左右描述",
-      "level": 2,
-      "prerequisites": ["core_1"],
-      "estimatedHours": 3,
-      "difficulty": "beginner"
-    }
-  ],
-  "edges": [
-    {"source": "root", "target": "core_1"},
-    {"source": "core_1", "target": "topic_1_1"}
-  ],
-  "metadata": {
-    "totalHours": 50,
-    "difficulty": "intermediate",
-    "description": "一句话总结"
-  }
-}
-
-生成规则：
-1. 根节点：1个
-2. 主干节点（level=1）：3-6个，各自独立，不使用"基础"、"进阶"、"概述"等泛化词
-3. 叶子节点（level=2）：每个主干下2-5个，具体可操作
-4. description 必须包含实质内容，150-250字
-5. 总节点数 15-28 个
-6. 全程使用中文`;
-
-  return retryWithBackoff(async () => {
-    const text = await callDeepSeek([
-      { role: "system", content: "你是一位专业的课程设计专家，只输出符合要求的 JSON，不输出任何其他内容。" },
-      { role: "user", content: prompt },
-    ], true);
-
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("No valid JSON found in response");
-
-    let rawData: any;
-    try {
-      rawData = JSON.parse(jsonMatch[0]);
-    } catch {
-      throw new Error("Failed to parse generated JSON");
-    }
-
-    const nodes = rawData.nodes.map((node: any, index: number) => {
-      let group: 'Foundation' | 'Core' | 'Advanced' | 'Practical' | 'Related' = 'Related';
-      if (node.level === 0) group = 'Foundation';
-      else if (node.level === 1) group = 'Core';
-      else if (node.level === 2) group = 'Advanced';
-
-      return {
-        id: node.id,
-        orderId: index + 1,
-        label: node.label,
-        description: node.description,
-        group,
-        level: node.level,
-        prerequisites: node.prerequisites,
-        estimatedHours: node.estimatedHours,
-        difficulty: node.difficulty,
-      };
-    });
-
-    return { nodes, edges: rawData.edges };
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: "system", content: "你是专业课程设计专家，只输出符合要求的 JSON。" },
+        { role: "user", content: prompt },
+      ],
+      response_format: { type: "json_object" },
+    }),
   });
+
+  if (!res.ok) return {};
+  const data = await res.json() as any;
+  const text = data.choices?.[0]?.message?.content as string || '';
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return {};
+  try {
+    return JSON.parse(jsonMatch[0]);
+  } catch {
+    return {};
+  }
 };
 
 export const fetchNodeDetails = async (nodeLabel: string, mainTopic: string): Promise<NodeDetailData> => {
@@ -162,12 +176,22 @@ export const fetchNodeDetails = async (nodeLabel: string, mainTopic: string): Pr
 
 重要：全部内容必须使用简体中文。`;
 
-  return retryWithBackoff(async () => {
-    const content = await callDeepSeek([
-      { role: "system", content: "你是一位专业的技术教育专家，用简体中文提供清晰、实用的学习指导。" },
-      { role: "user", content: prompt },
-    ]);
-
-    return { content: content || "暂无详细内容。", sources: [] };
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${getApiKey()}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: "system", content: "你是一位专业的技术教育专家，用简体中文提供清晰、实用的学习指导。" },
+        { role: "user", content: prompt },
+      ],
+    }),
   });
+
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json() as any;
+  return { content: data.choices?.[0]?.message?.content || "暂无详细内容。", sources: [] };
 };

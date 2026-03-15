@@ -24,6 +24,26 @@
   to   { opacity: 1; transform: translateY(0); }
 }
 
+/* ── Graph view enter transition ── */
+.animate-graph-enter {
+  animation: graphEnter 0.38s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes graphEnter {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Left panel content cross-fade ── */
+.animate-panel-in {
+  animation: panelIn 0.28s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes panelIn {
+  from { opacity: 0; transform: translateX(-8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
 /* ── Custom Scrollbar ── */
 .custom-scrollbar {
   scrollbar-width: thin;
