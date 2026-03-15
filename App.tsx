@@ -233,7 +233,7 @@ function App() {
 
           {/* Footer */}
           <div className="px-4 py-3 border-t border-zinc-100 flex-shrink-0">
-            <p className="text-[10px] text-zinc-300 text-center">Powered by Gemini 2.0 Flash</p>
+            <p className="text-[10px] text-zinc-300 text-center">Powered by DeepSeek</p>
           </div>
         </div>
       </aside>
