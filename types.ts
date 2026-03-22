@@ -65,3 +65,14 @@ export interface MyLearningItem {
   topic: string;
   addedAt: number;
 }
+
+export interface CardResources {
+  search_keywords: Array<{ platform: string; keyword: string }>;
+  books: Array<{ title: string; reason: string }>;
+  further_questions: string[];
+}
+
+export interface ParsedDetail {
+  mainContent: string;
+  resources: CardResources | null;
+}

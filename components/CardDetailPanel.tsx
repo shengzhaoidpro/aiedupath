@@ -2,8 +2,23 @@ import React, { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Send, X, MessageCircle } from 'lucide-react';
-import { Card, ChatMessage } from '../types';
+import { Card, ChatMessage, ParsedDetail } from '../types';
 import { buildActionPrompt, fetchCardDetail, sendFollowUp } from '../services/geminiService';
+import ResourcesBlock from './ResourcesBlock';
+
+function parseDetailResponse(rawText: string): ParsedDetail {
+  const SPLIT = '---RESOURCES---';
+  const idx = rawText.indexOf(SPLIT);
+  if (idx === -1) return { mainContent: rawText, resources: null };
+  const mainContent = rawText.slice(0, idx).trim();
+  const raw = rawText.slice(idx + SPLIT.length).trim();
+  try {
+    const clean = raw.replace(/```json|```/g, '').trim();
+    return { mainContent, resources: JSON.parse(clean) };
+  } catch {
+    return { mainContent, resources: null };
+  }
+}
 
 interface CardDetailPanelProps {
   card: Card;
@@ -267,7 +282,7 @@ export default function CardDetailPanel({ card, mainTopic, onClose }: CardDetail
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(); }
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); handleSubmit(); }
   };
 
   const MdContent = ({ children }: { children: string }) => (
@@ -326,11 +341,23 @@ export default function CardDetailPanel({ card, mainTopic, onClose }: CardDetail
         {/* Initial response */}
         {isInitialLoading && !initialContent ? (
           <Skeleton />
-        ) : (
-          <div className="px-6 py-6 [&>*:first-child]:mt-0">
-            <MdContent>{initialContent}</MdContent>
-          </div>
-        )}
+        ) : (() => {
+          const { mainContent, resources } = parseDetailResponse(initialContent);
+          return (
+            <div className="px-6 py-6 [&>*:first-child]:mt-0">
+              <MdContent>{mainContent}</MdContent>
+              {!isInitialLoading && resources && (
+                <ResourcesBlock
+                  resources={resources}
+                  onFollowUp={(q) => {
+                    setInputValue(q);
+                    setTimeout(() => inputRef.current?.focus(), 0);
+                  }}
+                />
+              )}
+            </div>
+          );
+        })()}
 
         {/* Follow-up thread */}
         {followUps.length > 0 && (

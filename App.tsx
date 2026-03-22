@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import PathView from './components/PathView';
 import CardDetailPanel from './components/CardDetailPanel';
+import CardDetailPage from './components/CardDetailPage';
 import VersionBar from './components/VersionBar';
 import PersonaCard from './components/PersonaCard';
 import MyLearningView from './components/MyLearningView';
@@ -90,7 +91,7 @@ function App() {
   const [selectedCard, setSelectedCard] = useState<Card | null>(null);
   const [activeTopic, setActiveTopic] = useState('');
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [currentView, setCurrentView] = useState<'home' | 'learning-space' | 'path' | 'my-learning'>('home');
+  const [currentView, setCurrentView] = useState<'home' | 'learning-space' | 'path' | 'my-learning' | 'card-detail'>('home');
   const [selectedCategory, setSelectedCategory] = useState<string>('ai');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [suggestionSetIndex, setSuggestionSetIndex] = useState(0);
@@ -339,10 +340,14 @@ function App() {
   // ── Navigation helpers ────────────────────────────────────────────────────
   const handleSearch = (e: React.FormEvent) => { e.preventDefault(); processTopicGeneration(query); };
   const handleTextareaKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); processTopicGeneration(query); }
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); processTopicGeneration(query); }
   };
   const handleIterationKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleIterate(); }
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); handleIterate(); }
+  };
+
+  const handleBackToPath = () => {
+    setCurrentView('path');
   };
 
   const handleNewTopic = () => {
@@ -378,11 +383,11 @@ function App() {
 
       {/* ── LEFT SIDEBAR ── */}
       <aside className={`flex-shrink-0 bg-white border-r border-zinc-100 z-30 transition-[width] duration-300 ease-in-out overflow-hidden ${
-        currentView === 'path' || isSidebarOpen ? 'w-64' : 'w-0'
+        currentView === 'path' || currentView === 'card-detail' || isSidebarOpen ? 'w-64' : 'w-0'
       }`}>
         <div className="w-64 h-full relative">
 
-          {currentView !== 'path' && (
+          {currentView !== 'path' && currentView !== 'card-detail' && (
             <div className="absolute inset-0 flex flex-col animate-panel-in">
               <div className="h-14 px-4 border-b border-zinc-100 flex items-center justify-between flex-shrink-0">
                 <div className="flex items-center gap-2.5">
@@ -431,7 +436,7 @@ function App() {
             </div>
           )}
 
-          {currentView === 'path' && (
+          {(currentView === 'path' || currentView === 'card-detail') && (
             <div className="absolute inset-0 flex flex-col animate-panel-in">
               <div className="h-14 px-4 border-b border-zinc-100 flex items-center justify-between flex-shrink-0">
                 <button onClick={handleNewTopic} className="flex items-center gap-1.5 text-zinc-400 hover:text-zinc-700 transition-colors text-xs font-medium">
@@ -468,12 +473,12 @@ function App() {
                   {allCards.map((card, i) => (
                     <button
                       key={card.card_id}
-                      onClick={() => setSelectedCard(card)}
-                      className={`w-full text-left px-3 py-2.5 rounded-xl text-xs mb-0.5 transition-all flex items-center gap-2.5 animate-fade-in ${selectedCard?.card_id === card.card_id ? 'bg-amber-50' : 'hover:bg-zinc-50'}`}
+                      onClick={() => { setSelectedCard(card); setCurrentView('card-detail'); }}
+                      className={`w-full text-left px-3 py-2.5 rounded-xl text-xs mb-0.5 transition-all flex items-center gap-2.5 animate-fade-in ${selectedCard?.card_id === card.card_id && currentView === 'card-detail' ? 'bg-amber-50' : 'hover:bg-zinc-50'}`}
                       style={{ animationDelay: `${i * 20}ms` }}
                     >
                       <span className="text-sm flex-shrink-0">{card.icon}</span>
-                      <span className={`flex-1 min-w-0 truncate font-medium ${selectedCard?.card_id === card.card_id ? 'text-amber-700' : 'text-zinc-600'}`}>
+                      <span className={`flex-1 min-w-0 truncate font-medium ${selectedCard?.card_id === card.card_id && currentView === 'card-detail' ? 'text-amber-700' : 'text-zinc-600'}`}>
                         {card.card_name}
                       </span>
                     </button>
@@ -715,7 +720,7 @@ function App() {
                 <PathView
                   path={learningPath}
                   selectedCardId={selectedCard?.card_id}
-                  onCardClick={setSelectedCard}
+                  onCardClick={(card) => { setSelectedCard(card); setCurrentView('card-detail'); }}
                   isStreaming={isStreaming}
                   persona={persona}
                   onPersonaTagClick={() => setPathPersonaOpen(true)}
@@ -760,23 +765,16 @@ function App() {
                 )}
               </>
             )}
-
-            {/* Backdrop + card detail panel */}
-            {selectedCard && (
-              <>
-                <div
-                  className="absolute inset-0 z-40 animate-backdrop-in"
-                  style={{ background: 'rgba(15,15,20,0.06)' }}
-                  onClick={() => setSelectedCard(null)}
-                />
-                <CardDetailPanel
-                  card={selectedCard}
-                  mainTopic={activeTopic}
-                  onClose={() => setSelectedCard(null)}
-                />
-              </>
-            )}
           </div>
+        )}
+
+        {/* ── CARD DETAIL PAGE (方案2) ── */}
+        {currentView === 'card-detail' && selectedCard && (
+          <CardDetailPage
+            card={selectedCard}
+            mainTopic={activeTopic}
+            onBack={handleBackToPath}
+          />
         )}
       </main>
     </div>
